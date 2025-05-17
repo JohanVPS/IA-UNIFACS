@@ -1,7 +1,8 @@
-import tensorflow as tf # type: ignore
-from tensorflow.keras import datasets, layers, models, mixed_precision # type: ignore
-import matplotlib.pyplot as plt # type: ignore
-import tensorflow_probability as tfp # type: ignore
+import tensorflow as tf
+from tensorflow.keras import datasets, layers, models, mixed_precision
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import matplotlib.pyplot as plt
+import tensorflow_probability as tfp
 
 # Ativa mixed precision
 mixed_precision.set_global_policy('mixed_float16')
@@ -24,28 +25,27 @@ else:
 train_images = train_images.astype('float32') / 255.0
 test_images = test_images.astype('float32') / 255.0
 
-# Cutmix helpers
+# Função CutMix
+
 def get_cutmix_box(img_shape, lam):
-    img_h, img_w = img_shape[0], img_shape[1]
+    img_h = tf.cast(img_shape[0], tf.float32)
+    img_w = tf.cast(img_shape[1], tf.float32)
     cut_rat = tf.math.sqrt(1. - lam)
-    cut_w = tf.cast(tf.cast(img_w, tf.float32) * cut_rat, tf.int32)
-    cut_h = tf.cast(tf.cast(img_h, tf.float32) * cut_rat, tf.int32)
+    cut_w = tf.cast(img_w * cut_rat, tf.int32)
+    cut_h = tf.cast(img_h * cut_rat, tf.int32)
 
-    cx = tf.random.uniform(shape=(), minval=0, maxval=img_w, dtype=tf.int32)
-    cy = tf.random.uniform(shape=(), minval=0, maxval=img_h, dtype=tf.int32)
+    cx = tf.random.uniform(shape=(), minval=0, maxval=tf.cast(img_w, tf.int32), dtype=tf.int32)
+    cy = tf.random.uniform(shape=(), minval=0, maxval=tf.cast(img_h, tf.int32), dtype=tf.int32)
 
-    bbx1 = tf.clip_by_value(cx - cut_w // 2, 0, img_w)
-    bby1 = tf.clip_by_value(cy - cut_h // 2, 0, img_h)
-    bbx2 = tf.clip_by_value(cx + cut_w // 2, 0, img_w)
-    bby2 = tf.clip_by_value(cy + cut_h // 2, 0, img_h)
+    bbx1 = tf.clip_by_value(cx - cut_w // 2, 0, tf.cast(img_w, tf.int32))
+    bby1 = tf.clip_by_value(cy - cut_h // 2, 0, tf.cast(img_h, tf.int32))
+    bbx2 = tf.clip_by_value(cx + cut_w // 2, 0, tf.cast(img_w, tf.int32))
+    bby2 = tf.clip_by_value(cy + cut_h // 2, 0, tf.cast(img_h, tf.int32))
 
     return bbx1, bby1, bbx2, bby2
 
 def cutmix(images, labels, alpha=1.0):
-    # images shape: (batch_size, height, width, channels)
     batch_size = tf.shape(images)[0]
-
-    # Embaralha o batch para pegar imagens para mixar
     indices = tf.random.shuffle(tf.range(batch_size))
     shuffled_images = tf.gather(images, indices)
     shuffled_labels = tf.gather(labels, indices)
@@ -53,83 +53,64 @@ def cutmix(images, labels, alpha=1.0):
     lam = tfp.distributions.Beta(alpha, alpha).sample()
     bbx1, bby1, bbx2, bby2 = get_cutmix_box(tf.shape(images)[1:3], lam)
 
-    # Ajusta lam de acordo com o recorte
-    area = tf.cast((bbx2 - bbx1) * (bby2 - bby1), tf.float32)
     img_area = tf.cast(tf.shape(images)[1] * tf.shape(images)[2], tf.float32)
+    area = tf.cast((bbx2 - bbx1) * (bby2 - bby1), tf.float32)
     lam = 1 - area / img_area
 
-    # Faz cutmix
-    # Criando máscara para patch
-    mask = tf.ones_like(images)
-    mask = tf.tensor_scatter_nd_update(
-        mask,
-        tf.stack(
-            [
-                tf.repeat(tf.range(batch_size), (bby2 - bby1) * (bbx2 - bbx1)),
-                tf.tile(tf.reshape(tf.range(bby1, bby2), (-1,1)), [(bbx2 - bbx1),1]),
-                tf.tile(tf.reshape(tf.range(bbx1, bbx2), (1,-1)), [(bby2 - bby1),1]),
-                tf.zeros([(bby2 - bby1) * (bbx2 - bbx1)], dtype=tf.int32)
-            ],
-            axis=1
-        ),
-        tf.zeros([(bby2 - bby1) * (bbx2 - bbx1) * batch_size, 3], dtype=images.dtype)
-    )
+    new_images = tf.identity(images)
+    new_images[:, bby1:bby2, bbx1:bbx2, :] = shuffled_images[:, bby1:bby2, bbx1:bbx2, :]
 
-    images = images * mask + shuffled_images * (1 - mask)
-    labels = lam * labels + (1 - lam) * shuffled_labels
-    return images, labels
+    new_labels = lam * labels + (1 - lam) * shuffled_labels
+    return new_images, new_labels
 
 def apply_cutmix(images, labels):
-    import tensorflow_probability as tfp
     return cutmix(images, labels)
 
-# Função de augmentação com cutout e cutmix
 def augment(image, label):
     image = tf.image.random_flip_left_right(image)
     image = tf.image.random_brightness(image, 0.1)
     image = tf.image.random_contrast(image, 0.9, 1.1)
     return image, label
 
-# Modelo CNN otimizado
 def create_improved_model():
     model = models.Sequential([
         layers.Input(shape=(32,32,3)),
-        layers.Conv2D(32, (3,3), padding='same', kernel_initializer='he_uniform'),
-        layers.BatchNormalization(),
-        layers.Activation('relu'),
-        layers.Conv2D(32, (3,3), padding='same', kernel_initializer='he_uniform'),
-        layers.BatchNormalization(),
-        layers.Activation('relu'),
-        layers.MaxPooling2D((2,2)),
-        layers.Dropout(0.2),
-
         layers.Conv2D(64, (3,3), padding='same', kernel_initializer='he_uniform'),
         layers.BatchNormalization(),
-        layers.Activation('relu'),
+        layers.Activation('gelu'),
         layers.Conv2D(64, (3,3), padding='same', kernel_initializer='he_uniform'),
         layers.BatchNormalization(),
-        layers.Activation('relu'),
+        layers.Activation('gelu'),
         layers.MaxPooling2D((2,2)),
         layers.Dropout(0.3),
 
         layers.Conv2D(128, (3,3), padding='same', kernel_initializer='he_uniform'),
         layers.BatchNormalization(),
-        layers.Activation('relu'),
+        layers.Activation('gelu'),
         layers.Conv2D(128, (3,3), padding='same', kernel_initializer='he_uniform'),
         layers.BatchNormalization(),
-        layers.Activation('relu'),
+        layers.Activation('gelu'),
         layers.MaxPooling2D((2,2)),
         layers.Dropout(0.4),
 
-        layers.Flatten(),
-        layers.Dense(128, kernel_initializer='he_uniform'),
+        layers.Conv2D(256, (3,3), padding='same', kernel_initializer='he_uniform'),
         layers.BatchNormalization(),
-        layers.Activation('relu'),
+        layers.Activation('gelu'),
+        layers.Conv2D(256, (3,3), padding='same', kernel_initializer='he_uniform'),
+        layers.BatchNormalization(),
+        layers.Activation('gelu'),
+        layers.MaxPooling2D((2,2)),
+        layers.Dropout(0.5),
+
+        layers.Flatten(),
+        layers.Dense(256, kernel_initializer='he_uniform'),
+        layers.BatchNormalization(),
+        layers.Activation('gelu'),
         layers.Dropout(0.5),
         layers.Dense(10, dtype='float32'),
     ])
 
-    opt = tf.keras.optimizers.Adam(learning_rate=0.001)
+    opt = tf.keras.optimizers.AdamW(learning_rate=0.001, weight_decay=1e-4)
     model.compile(optimizer=opt,
                   loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
                   metrics=['accuracy'])
@@ -148,11 +129,11 @@ def train_improved_model(epochs=50, batch_size=128):
     val_labels = test_labels[:5000]
 
     callbacks = [
-        tf.keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=5, restore_best_weights=True),
-        tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3, min_lr=1e-5)
+        EarlyStopping(monitor='val_accuracy', patience=6, restore_best_weights=True),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-5)
     ]
 
-    history = model.fit(train_dataset, epochs=epochs, validation_data=(val_images, val_labels))
+    history = model.fit(train_dataset, epochs=epochs, validation_data=(val_images, val_labels), callbacks=callbacks)
     return model, history
 
 def evaluate_and_visualize(model, history):
@@ -182,6 +163,5 @@ def evaluate_and_visualize(model, history):
     return test_acc
 
 if __name__ == "__main__":
-    import tensorflow_probability as tfp
     model, history = train_improved_model()
     evaluate_and_visualize(model, history)
