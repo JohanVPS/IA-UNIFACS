@@ -116,7 +116,7 @@ def create_improved_model():
                   metrics=['accuracy'])
     return model
 
-def train_improved_model(epochs=50, batch_size=128):
+def train_improved_model(epochs=110, batch_size=128):
     model = create_improved_model()
 
     train_dataset = tf.data.Dataset.from_tensor_slices((train_images, train_labels))
@@ -129,8 +129,8 @@ def train_improved_model(epochs=50, batch_size=128):
     val_labels = test_labels[:5000]
 
     callbacks = [
-        EarlyStopping(monitor='val_accuracy', patience=6, restore_best_weights=True),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-5)
+        EarlyStopping(monitor='val_accuracy', patience=20, restore_best_weights=True),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=18, min_lr=1e-5)
     ]
 
     history = model.fit(train_dataset, epochs=epochs, validation_data=(val_images, val_labels), callbacks=callbacks)
